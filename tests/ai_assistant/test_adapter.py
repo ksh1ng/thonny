@@ -52,3 +52,10 @@ class AdapterTests(unittest.TestCase):
         runner.is_waiting_toplevel_command.return_value = True
         adapter.execute_current()
         runner.execute_current.assert_called_once_with("Run")
+
+    def test_configure_esp32_updates_options_and_restarts(self):
+        workbench, runner = Mock(), Mock()
+        ThonnyAdapter(workbench, runner).configure_esp32("/dev/cu.usbserial-test")
+        workbench.set_option.assert_any_call("run.backend_name", "ESP32")
+        workbench.set_option.assert_any_call("ESP32.port", "/dev/cu.usbserial-test")
+        runner.restart_backend.assert_called_once_with(clean=False, first=False, automatic=False)

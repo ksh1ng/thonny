@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 from thonny.plugins.ai_assistant.code_sanitizer import extract_code, redact
 from thonny.plugins.ai_assistant.config_manager import ConfigManager
+from thonny.plugins.ai_assistant.device_setup import SetupState, choose_state, port_choices, requests_esp32
 from thonny.plugins.ai_assistant.hardware_context import detect_hardware, describe_hardware
 from thonny.plugins.ai_assistant.models import GenerationRequest
 from thonny.plugins.ai_assistant.providers.openai_compatible import OpenAICompatibleProvider, endpoint, profile_for
@@ -89,3 +90,24 @@ class HardwareTests(unittest.TestCase):
         context = detect_hardware(wb, runner)
         self.assertEqual(context.platform, "ESP32")
         self.assertNotIn("GPIO2", describe_hardware(context))
+
+
+class DeviceSetupTests(unittest.TestCase):
+    def test_detects_esp32_intent(self):
+        self.assertTrue(requests_esp32("用 ESP32 做 LED blink"))
+        self.assertTrue(requests_esp32("configure my esp-32 board"))
+        self.assertFalse(requests_esp32("write a Python loop"))
+
+    def test_setup_state(self):
+        self.assertEqual(choose_state([], "Local Python 3", False), SetupState.CONNECT_DEVICE)
+        self.assertEqual(choose_state([object()], "Local Python 3", False), SetupState.SELECT_PORT)
+        self.assertEqual(choose_state([], "ESP32", True), SetupState.READY)
+
+    def test_prioritizes_thonny_detected_ports(self):
+        ports = [
+            SimpleNamespace(device="/dev/a", description="USB serial"),
+            SimpleNamespace(device="/dev/b", description="ESP32"),
+        ]
+        choices = port_choices(ports, {"/dev/b"})
+        self.assertFalse(choices[0].likely_esp32)
+        self.assertTrue(choices[1].likely_esp32)

@@ -6,6 +6,7 @@ from tkinter import messagebox, scrolledtext, ttk
 from thonny import get_runner, get_workbench
 from thonny.plugins.ai_assistant.code_sanitizer import extract_code
 from thonny.plugins.ai_assistant.config_manager import ConfigManager
+from thonny.plugins.ai_assistant.device_setup import SetupState, choose_state, requests_esp32
 from thonny.plugins.ai_assistant.hardware_context import detect_hardware
 from thonny.plugins.ai_assistant.models import GenerationRequest
 from thonny.plugins.ai_assistant.prompt_builder import build_messages
@@ -35,6 +36,10 @@ class AIAssistantView(ttk.Frame):
         self.auto_fix = tk.BooleanVar(value=self.config.get("auto_fix"))
         self.status_text, self.hardware_text = tk.StringVar(value="Ready"), tk.StringVar()
         self.account_text = tk.StringVar(value="Account status: unknown")
+        self.device_status_text = tk.StringVar(value="Connect an ESP32 to begin")
+        self.device_port = tk.StringVar()
+        self.device_ports = {}
+        self.pending_prompt = None
         self._build_ui()
         self._provider_changed()
         self.refresh_hardware()
@@ -42,7 +47,7 @@ class AIAssistantView(ttk.Frame):
 
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
         config = ttk.LabelFrame(self, text="Model", padding=5)
         config.grid(row=0, column=0, sticky="ew")
         config.columnconfigure(1, weight=1)
@@ -73,32 +78,50 @@ class AIAssistantView(ttk.Frame):
         self.status_button.pack(side="left", padx=3)
         self.sign_out_button = ttk.Button(account_buttons, text="Sign out", command=self.sign_out)
         self.sign_out_button.pack(side="left")
+        self.device_frame = ttk.LabelFrame(self, text="ESP32 setup", padding=5)
+        self.device_frame.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        self.device_frame.columnconfigure(0, weight=1)
+        ttk.Label(self.device_frame, textvariable=self.device_status_text, wraplength=360).grid(
+            row=0, column=0, columnspan=4, sticky="ew"
+        )
+        self.port_combo = ttk.Combobox(self.device_frame, textvariable=self.device_port, state="readonly")
+        self.port_combo.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(self.device_frame, text="Scan", command=self.scan_esp32).grid(row=1, column=1, padx=(4, 0), pady=(4, 0))
+        ttk.Button(self.device_frame, text="Configure", command=self.configure_esp32).grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
+        ttk.Button(self.device_frame, text="Install MicroPython…", command=self.install_micropython).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        ttk.Button(self.device_frame, text="Save as /main.py", command=self.save_main_to_device).grid(
+            row=2, column=2, columnspan=2, sticky="e", pady=(4, 0)
+        )
+        self.device_frame.grid_remove()
         context = ttk.Frame(self)
-        context.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        context.grid(row=2, column=0, sticky="ew", pady=(4, 2))
         ttk.Label(context, textvariable=self.hardware_text).pack(side="left", fill="x", expand=True)
         ttk.Button(context, text="↻", width=3, command=self.refresh_hardware).pack(side="right")
+        ttk.Button(context, text="ESP32 setup", command=self.scan_esp32).pack(side="right", padx=(0, 4))
         self.chat = scrolledtext.ScrolledText(self, wrap="word", state="disabled", height=12)
-        self.chat.grid(row=2, column=0, sticky="nsew")
+        self.chat.grid(row=3, column=0, sticky="nsew")
         self.chat.tag_configure("user", foreground="#1769aa", spacing1=8)
         self.chat.tag_configure("assistant", foreground="#237a3b", spacing1=8)
         self.chat.tag_configure("error", foreground="#b3261e", spacing1=8)
         self.input = tk.Text(self, height=5, wrap="word", undo=True)
-        self.input.grid(row=3, column=0, sticky="ew", pady=(5, 2))
+        self.input.grid(row=4, column=0, sticky="ew", pady=(5, 2))
         self.input.bind("<Control-Return>", self._send_event)
         self.input.bind("<Command-Return>", self._send_event)
         options = ttk.Frame(self)
-        options.grid(row=4, column=0, sticky="ew")
+        options.grid(row=5, column=0, sticky="ew")
         for label, var in (("Write to editor", self.write_editor), ("Auto-run", self.auto_run), ("Auto-fix", self.auto_fix)):
             ttk.Checkbutton(options, text=label, variable=var).pack(side="left")
         buttons = ttk.Frame(self)
-        buttons.grid(row=5, column=0, sticky="ew", pady=(3, 0))
+        buttons.grid(row=6, column=0, sticky="ew", pady=(3, 0))
         self.send_button = ttk.Button(buttons, text="Send", command=self.send)
         self.send_button.pack(side="right")
         self.cancel_button = ttk.Button(buttons, text="Cancel", command=self.cancel, state="disabled")
         self.cancel_button.pack(side="right", padx=4)
         ttk.Button(buttons, text="Write code", command=self.write_last_code).pack(side="right")
         ttk.Button(buttons, text="Clear", command=self.clear).pack(side="left")
-        ttk.Label(self, textvariable=self.status_text).grid(row=6, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(self, textvariable=self.status_text).grid(row=7, column=0, sticky="w", pady=(3, 0))
 
     def _provider_changed(self):
         profile = profile_for(self.provider_id.get())
@@ -185,14 +208,97 @@ class AIAssistantView(ttk.Frame):
         if not self.model.get().strip():
             messagebox.showerror("AI Assistant", "Select or enter a model first", parent=self); return
         self.input.delete("1.0", "end")
-        self.history.append({"role": "user", "content": prompt})
-        self._append_message("You", prompt, "user")
+        if requests_esp32(prompt):
+            hardware = self.refresh_hardware()
+            if not (hardware.connected and hardware.platform == "ESP32"):
+                self.pending_prompt = prompt
+                self.device_frame.grid()
+                self.history.append({"role": "user", "content": prompt})
+                self._append_message("You", prompt, "user")
+                self._append_message(
+                    "Assistant",
+                    "I’ll prepare the ESP32 first. Connect it with a data-capable USB cable; "
+                    "I’ll select the interpreter and verify MicroPython before generating code.",
+                    "assistant",
+                )
+                self.scan_esp32()
+                return
+        self._start_generation(prompt)
+
+    def _start_generation(self, prompt, add_user=True):
+        if add_user:
+            self.history.append({"role": "user", "content": prompt})
+            self._append_message("You", prompt, "user")
         self._append_message("Assistant", "", "assistant")
         self.last_assistant_text, self.cancel_event = "", threading.Event()
         request = GenerationRequest(self.model.get().strip(), build_messages(self.history, self.refresh_hardware()))
         self._save_preferences(); self._busy(True, "Generating…")
         self.worker = threading.Thread(target=self._generate_worker, args=(self._provider(), request, self.cancel_event), daemon=True)
         self.worker.start()
+
+    def scan_esp32(self):
+        self.device_frame.grid()
+        try:
+            choices = self.adapter.list_esp32_ports()
+            self.device_ports = {choice.label: choice for choice in choices}
+            labels = [choice.label for choice in choices]
+            self.port_combo["values"] = labels
+            if not labels:
+                self.device_port.set("")
+                self.device_status_text.set("1/4 Connect the ESP32 with a data-capable USB cable, then click Scan.")
+                return
+            likely = [choice for choice in choices if choice.likely_esp32]
+            selected = likely[0] if len(likely) == 1 else choices[0]
+            self.device_port.set(selected.label)
+            if len(choices) == 1 or len(likely) == 1:
+                self.configure_esp32()
+            else:
+                self.device_status_text.set("1/4 Select the ESP32 serial port, then click Configure.")
+        except Exception as exc:
+            self.device_status_text.set("Could not scan serial ports: %s" % exc)
+
+    def configure_esp32(self):
+        choice = self.device_ports.get(self.device_port.get())
+        if choice is None:
+            messagebox.showinfo("ESP32 setup", "Connect the board and select its serial port first.", parent=self)
+            return
+        try:
+            self.device_status_text.set("2/4 Selecting the ESP32 interpreter and checking MicroPython…")
+            self.adapter.configure_esp32(choice.device)
+        except Exception as exc:
+            self.device_status_text.set("Could not configure ESP32: %s" % exc)
+
+    def install_micropython(self):
+        try:
+            self.device_status_text.set("Use Thonny’s installer to erase and install MicroPython firmware.")
+            new_port = self.adapter.open_esp32_firmware_installer()
+            self.scan_esp32()
+            if new_port:
+                for label, choice in self.device_ports.items():
+                    if choice.device == new_port:
+                        self.device_port.set(label)
+                        self.configure_esp32()
+                        break
+        except Exception as exc:
+            messagebox.showerror("ESP32 setup", str(exc), parent=self)
+
+    def save_main_to_device(self):
+        try:
+            cleaned = extract_code(self.last_assistant_text)
+            if not cleaned.code.strip():
+                raise RuntimeError("Generate MicroPython code first")
+            if not messagebox.askyesno(
+                "Save to ESP32",
+                "Save the generated code as /main.py? This replaces the existing /main.py and runs after reset.",
+                parent=self,
+            ):
+                return False
+            self.adapter.write_main_to_device(cleaned.code)
+            self.device_status_text.set("4/4 Saved /main.py. Press Run in Thonny or reset the ESP32.")
+            return True
+        except Exception as exc:
+            messagebox.showerror("ESP32 setup", str(exc), parent=self)
+            return False
 
     def _generate_worker(self, provider, request, cancel):
         try:
@@ -268,7 +374,23 @@ class AIAssistantView(ttk.Frame):
             self.config.set(name, value)
 
     def _on_backend_event(self, name, event):
-        if name in ("BackendRestart", "BackendTerminated", "ToplevelResponse"): self.refresh_hardware()
+        if name not in ("BackendRestart", "BackendTerminated", "ToplevelResponse"):
+            return
+        hardware = self.refresh_hardware()
+        state = choose_state([], hardware.board, hardware.connected)
+        if name == "BackendRestart":
+            self.device_status_text.set("2/4 Checking the ESP32 and MicroPython firmware…")
+        elif name == "BackendTerminated" and self.pending_prompt:
+            self.device_frame.grid()
+            self.device_status_text.set(
+                "MicroPython did not start. Check the USB connection; if the board is blank or uses other firmware, click Install MicroPython."
+            )
+        elif name == "ToplevelResponse" and state == SetupState.READY:
+            self.device_frame.grid()
+            self.device_status_text.set("3/4 ESP32 is connected and MicroPython is ready. Generating your program…")
+            if self.pending_prompt:
+                prompt, self.pending_prompt = self.pending_prompt, None
+                self.after_idle(lambda: self._start_generation(prompt, add_user=False))
 
     def destroy(self):
         self.cancel_event.set(); self.adapter.close(); super().destroy()
