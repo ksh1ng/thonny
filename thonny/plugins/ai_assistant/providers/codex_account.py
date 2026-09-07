@@ -35,7 +35,24 @@ class CodexAccountProvider:
         return result.returncode == 0, text
 
     def login(self):
-        return self.popen([self.executable, "login"])
+        return self.popen(
+            [self.executable, "login"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def finish_login(self, process, timeout=300):
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.communicate()
+            raise ProviderError("OpenAI account sign-in timed out") from exc
+        if process.returncode:
+            detail = (stdout + stderr).strip()
+            raise AuthenticationError(detail[-500:] or "OpenAI account sign-in failed")
+        return self.auth_status()
 
     def logout(self):
         return self.run([self.executable, "logout"], capture_output=True, text=True, timeout=30)

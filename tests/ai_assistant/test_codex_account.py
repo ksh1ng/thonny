@@ -21,6 +21,7 @@ class FakeProcess:
     def poll(self): return self.returncode
     def kill(self): self.returncode = -9
     def terminate(self): self.returncode = -15
+    def communicate(self, timeout=None): self.returncode = 0; return ("Login successful", "")
 
 
 class CodexAccountTests(unittest.TestCase):
@@ -41,6 +42,10 @@ class CodexAccountTests(unittest.TestCase):
         run = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
         popen = Mock()
         provider = CodexAccountProvider("/bin/codex", popen=popen, run=run)
-        provider.login(); provider.logout()
-        popen.assert_called_once_with(["/bin/codex", "login"])
+        process = FakeProcess(); popen.return_value = process
+        login_process = provider.login()
+        self.assertEqual(provider.finish_login(login_process), (True, ""))
+        provider.logout()
+        self.assertEqual(popen.call_args.args[0], ["/bin/codex", "login"])
+        self.assertTrue(popen.call_args.kwargs["text"])
         self.assertIn("logout", run.call_args.args[0])

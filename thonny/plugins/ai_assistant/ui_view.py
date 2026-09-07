@@ -34,6 +34,7 @@ class AIAssistantView(ttk.Frame):
         self.auto_run = tk.BooleanVar(value=self.config.get("auto_run"))
         self.auto_fix = tk.BooleanVar(value=self.config.get("auto_fix"))
         self.status_text, self.hardware_text = tk.StringVar(value="Ready"), tk.StringVar()
+        self.account_text = tk.StringVar(value="Account status: unknown")
         self._build_ui()
         self._provider_changed()
         self.refresh_hardware()
@@ -62,9 +63,16 @@ class AIAssistantView(ttk.Frame):
         self.refresh_button.grid(row=4, column=1, sticky="e", pady=(4, 0))
         self.account_frame = ttk.Frame(config)
         self.account_frame.grid(row=5, column=0, columnspan=2, sticky="e")
-        ttk.Button(self.account_frame, text="Sign in", command=self.sign_in).pack(side="left")
-        ttk.Button(self.account_frame, text="Status", command=self.account_status).pack(side="left", padx=3)
-        ttk.Button(self.account_frame, text="Sign out", command=self.sign_out).pack(side="left")
+        self.account_label = ttk.Label(self.account_frame, textvariable=self.account_text)
+        self.account_label.pack(side="top", fill="x", pady=(2, 3))
+        account_buttons = ttk.Frame(self.account_frame)
+        account_buttons.pack(side="top", anchor="e")
+        self.sign_in_button = ttk.Button(account_buttons, text="Sign in", command=self.sign_in)
+        self.sign_in_button.pack(side="left")
+        self.status_button = ttk.Button(account_buttons, text="Status", command=self.account_status)
+        self.status_button.pack(side="left", padx=3)
+        self.sign_out_button = ttk.Button(account_buttons, text="Sign out", command=self.sign_out)
+        self.sign_out_button.pack(side="left")
         context = ttk.Frame(self)
         context.grid(row=1, column=0, sticky="ew", pady=(4, 2))
         ttk.Label(context, textvariable=self.hardware_text).pack(side="left", fill="x", expand=True)
@@ -99,6 +107,7 @@ class AIAssistantView(ttk.Frame):
         self.key_entry.configure(state="disabled" if profile.id == "codex" else "normal")
         self.account_frame.grid() if profile.id == "codex" else self.account_frame.grid_remove()
         self.config.set("provider", profile.id)
+        if profile.id == "codex": self.account_status(show_dialog=False)
 
     def _provider(self):
         profile = profile_for(self.provider_id.get())
@@ -109,21 +118,46 @@ class AIAssistantView(ttk.Frame):
 
     def sign_in(self):
         try:
-            self._provider().login()
-            self.status_text.set("Complete sign-in in your browser")
+            provider = self._provider()
+            process = provider.login()
+            self._account_busy(True, "Waiting for browser sign-in…")
+            threading.Thread(target=self._login_worker, args=(provider, process), daemon=True).start()
         except Exception as exc: messagebox.showerror("AI Assistant", str(exc), parent=self)
+
+    def _login_worker(self, provider, process):
+        try:
+            logged_in, detail = provider.finish_login(process)
+            self.events.put(("account", (logged_in, detail, True)))
+        except Exception as exc:
+            self.events.put(("account", (False, str(exc), True)))
 
     def sign_out(self):
+        self._account_busy(True, "Signing out…")
+        threading.Thread(target=self._logout_worker, args=(self._provider(),), daemon=True).start()
+
+    def _logout_worker(self, provider):
         try:
-            result = self._provider().logout()
-            self.status_text.set("Signed out" if result.returncode == 0 else "Sign-out failed")
+            result = provider.logout()
+            detail = (result.stdout + result.stderr).strip()
+            self.events.put(("account", (False, detail or "Signed out", True)))
+        except Exception as exc: self.events.put(("account", (False, str(exc), True)))
+
+    def account_status(self, show_dialog=True):
+        try:
+            self._account_busy(True, "Checking account…")
+            threading.Thread(target=self._status_worker, args=(self._provider(), show_dialog), daemon=True).start()
         except Exception as exc: messagebox.showerror("AI Assistant", str(exc), parent=self)
 
-    def account_status(self):
+    def _status_worker(self, provider, show_dialog):
         try:
-            logged_in, detail = self._provider().auth_status()
-            messagebox.showinfo("OpenAI account", detail or ("Signed in" if logged_in else "Signed out"), parent=self)
-        except Exception as exc: messagebox.showerror("AI Assistant", str(exc), parent=self)
+            logged_in, detail = provider.auth_status()
+            self.events.put(("account", (logged_in, detail, show_dialog)))
+        except Exception as exc: self.events.put(("account", (False, str(exc), show_dialog)))
+
+    def _account_busy(self, busy, text=None):
+        state = "disabled" if busy else "normal"
+        for button in (self.sign_in_button, self.status_button, self.sign_out_button): button.configure(state=state)
+        if text: self.account_text.set(text)
 
     def refresh_hardware(self):
         hardware = detect_hardware(self.workbench, self.runner)
@@ -182,6 +216,13 @@ class AIAssistantView(ttk.Frame):
                     if value and self.model.get() not in value: self.model.set(value[0])
                 elif kind == "error": self._append_message("Error", value, "error")
                 elif kind == "cancelled": self._append_message("System", "Request cancelled", "error")
+                elif kind == "account":
+                    logged_in, detail, show_dialog = value
+                    label = "Signed in with ChatGPT" if logged_in else "Not signed in"
+                    self.account_text.set(label)
+                    self.account_label.configure(foreground="#237a3b" if logged_in else "#b3261e")
+                    self._account_busy(False)
+                    if show_dialog: messagebox.showinfo("OpenAI account", detail or label, parent=self)
                 elif kind == "idle": self._busy(False, "Ready")
         except queue.Empty: pass
         if self.winfo_exists(): self.after(40, self._drain_events)
