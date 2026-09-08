@@ -49,6 +49,17 @@ class ThonnyAdapter:
             raise RuntimeError("Stop the current program before running generated code")
         self.runner.execute_current("Run")
 
+    def ready_for_run(self):
+        return bool(
+            self.runner.get_backend_proxy()
+            and self.runner.is_waiting_toplevel_command()
+        )
+
+    def interrupt_current(self):
+        proxy = self.runner.get_backend_proxy()
+        if proxy is not None and proxy.is_connected():
+            proxy.interrupt()
+
     def list_esp32_ports(self):
         from thonny.plugins.esp import ESP32Proxy
         from thonny.plugins.micropython.mp_front import list_serial_ports

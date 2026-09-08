@@ -14,7 +14,9 @@ class HilState(Enum):
     FAILED = "failed"
     REPAIRING = "repairing"
     WAITING_INPUT = "waiting_input"
+    AWAITING_HARDWARE = "awaiting_hardware"
     DISCONNECTED = "disconnected"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -40,12 +42,17 @@ ERROR_RE = re.compile(
 )
 READY_MARKER = "[HIL:READY]"
 PASS_MARKER = "[HIL:PASS]"
+HARDWARE_MARKER = "[HIL:HW_ACTION]"
+HARDWARE_ERROR_RE = re.compile(
+    r"(?:OSError:\s*\[Errno\s*(?:5|19)\]|ENODEV|device not found|no i2c device)",
+    re.IGNORECASE,
+)
 
 
 class HilAgent:
     """Correlates bounded backend output with one generated-code run."""
 
-    def __init__(self, max_repairs=2, max_output_chars=12000):
+    def __init__(self, max_repairs=None, max_output_chars=12000):
         self.max_repairs = max_repairs
         self.max_output_chars = max_output_chars
         self.active = None
@@ -77,9 +84,18 @@ class HilAgent:
         return HilDecision(self.state, reason, False)
 
     def feed_output(self, data):
-        if self.active is None or self.state != HilState.RUNNING:
+        if self.active is None or self.state not in (HilState.RUNNING, HilState.WAITING_INPUT):
             return None
+        if self.state == HilState.WAITING_INPUT:
+            self.state = HilState.RUNNING
         self.active.output = (self.active.output + str(data))[-self.max_output_chars :]
+        if HARDWARE_MARKER in self.active.output:
+            line = self.active.output.rsplit(HARDWARE_MARKER, 1)[1].splitlines()[0].strip()
+            return self._hardware_action(line or "Check the external hardware connection")
+        if HARDWARE_ERROR_RE.search(self.active.output):
+            return self._hardware_action(
+                "The target cannot communicate with an external device. Check power, ground, wiring and pin assignments."
+            )
         if ERROR_RE.search(self.active.output):
             return self._failure("Target traceback detected")
         if PASS_MARKER in self.active.output:
@@ -123,6 +139,20 @@ class HilAgent:
         self.state = HilState.DISCONNECTED
         return HilDecision(self.state, "Target disconnected")
 
+    def resume_after_hardware(self):
+        if self.active is None or self.state != HilState.AWAITING_HARDWARE:
+            return None
+        previous = self.active
+        self.active = RunRecord(
+            str(uuid.uuid4()),
+            previous.requirement,
+            previous.code,
+            previous.code_hash,
+            previous.attempt,
+        )
+        self.state = HilState.ARMED
+        return HilDecision(self.state, "Hardware updated; waiting to rerun on target")
+
     def observe(self, passed, feedback=""):
         if self.active is None or self.state != HilState.AWAITING_OBSERVATION:
             return None
@@ -134,7 +164,20 @@ class HilAgent:
     def mark_repairing(self):
         self.state = HilState.REPAIRING
 
+    def cancel(self):
+        if self.active is None or self.state in (HilState.IDLE, HilState.PASSED):
+            return None
+        self.state = HilState.CANCELLED
+        return HilDecision(self.state, "HIL validation cancelled by user")
+
     def _failure(self, reason):
         self.state = HilState.FAILED
-        can_repair = bool(self.active and self.active.attempt < self.max_repairs)
+        can_repair = bool(
+            self.active
+            and (self.max_repairs is None or self.active.attempt < self.max_repairs)
+        )
         return HilDecision(self.state, reason, can_repair)
+
+    def _hardware_action(self, reason):
+        self.state = HilState.AWAITING_HARDWARE
+        return HilDecision(self.state, reason, False)

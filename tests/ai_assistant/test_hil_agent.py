@@ -47,6 +47,8 @@ class HilAgentTests(unittest.TestCase):
         agent.command_accepted("Run")
         self.assertEqual(agent.input_requested().state, HilState.WAITING_INPUT)
         self.assertFalse(agent.input_requested().request_repair)
+        self.assertIsNone(agent.feed_output("SSID received\n"))
+        self.assertEqual(agent.state, HilState.RUNNING)
         self.assertEqual(agent.disconnected().state, HilState.DISCONNECTED)
 
     def test_output_is_bounded(self):
@@ -72,3 +74,35 @@ class HilAgentTests(unittest.TestCase):
         self.assertIsNone(agent.feed_output("Traceback (most recent call last):"))
         self.assertIsNone(agent.command_accepted("write_file"))
         self.assertEqual(agent.command_accepted("Run").state, HilState.RUNNING)
+
+    def test_hardware_marker_pauses_and_reruns_same_code(self):
+        agent = HilAgent()
+        agent.start("read sensor", "probe()")
+        agent.command_accepted("Run")
+        decision = agent.feed_output("[HIL:HW_ACTION] Connect SDA to GPIO21\n")
+        self.assertEqual(decision.state, HilState.AWAITING_HARDWARE)
+        self.assertIn("GPIO21", decision.reason)
+        resumed = agent.resume_after_hardware()
+        self.assertEqual(resumed.state, HilState.ARMED)
+        self.assertEqual(agent.active.code, "probe()")
+
+    def test_known_missing_device_error_requests_hardware_action(self):
+        agent = HilAgent()
+        agent.start("read sensor", "probe()")
+        agent.command_accepted("Run")
+        decision = agent.feed_output("OSError: [Errno 19] ENODEV\n")
+        self.assertEqual(decision.state, HilState.AWAITING_HARDWARE)
+        self.assertFalse(decision.request_repair)
+
+    def test_autopilot_has_no_fixed_repair_limit(self):
+        agent = HilAgent(max_repairs=None)
+        agent.start("task", "code-99", attempt=99)
+        agent.command_accepted("Run")
+        decision = agent.feed_output("Traceback (most recent call last):\nValueError: bad")
+        self.assertTrue(decision.request_repair)
+
+    def test_user_can_cancel_active_validation(self):
+        agent = HilAgent()
+        agent.start("blink", "code")
+        self.assertEqual(agent.cancel().state, HilState.CANCELLED)
+        self.assertIsNone(agent.command_accepted("Run"))

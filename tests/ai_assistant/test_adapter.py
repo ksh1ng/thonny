@@ -59,3 +59,12 @@ class AdapterTests(unittest.TestCase):
         workbench.set_option.assert_any_call("run.backend_name", "ESP32")
         workbench.set_option.assert_any_call("ESP32.port", "/dev/cu.usbserial-test")
         runner.restart_backend.assert_called_once_with(clean=False, first=False, automatic=False)
+
+    def test_interrupt_uses_connected_backend_proxy(self):
+        runner = Mock()
+        proxy = runner.get_backend_proxy.return_value
+        proxy.is_connected.return_value = True
+        adapter = ThonnyAdapter(Mock(), runner)
+        self.assertTrue(adapter.ready_for_run())
+        adapter.interrupt_current()
+        proxy.interrupt.assert_called_once_with()

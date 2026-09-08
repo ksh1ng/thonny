@@ -11,7 +11,11 @@ assignments instead of guessing. For hardware programs, print [HIL:READY] with a
 short description only after peripheral initialization succeeds. Print [HIL:PASS]
 only when the program has actually measured a testable invariant; never claim a
 physical LED, motor, buzzer or display worked without sensor feedback. Keep
-explanations concise."""
+explanations concise. Probe external I2C/SPI/UART devices before the main loop.
+When a probe shows missing power, wiring or a peripheral, print
+[HIL:HW_ACTION] followed by a concrete wiring instruction and stop cleanly so
+the assistant can pause for the user. Interactive input() prompts are allowed;
+continue validation after the user responds in Thonny's Shell."""
 
 
 def build_messages(history, hardware):

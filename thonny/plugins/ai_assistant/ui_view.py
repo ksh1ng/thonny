@@ -41,10 +41,11 @@ class AIAssistantView(ttk.Frame):
         self.device_port = tk.StringVar()
         self.device_ports = {}
         self.pending_prompt = None
-        self.hil = HilAgent(max_repairs=2)
+        self.hil = HilAgent(max_repairs=None)
         self.hil_status_text = tk.StringVar(value="HIL verification idle")
         self.current_requirement = ""
         self.generation_attempt = 0
+        self.hil_autopilot = False
         self._build_ui()
         self._provider_changed()
         self.refresh_hardware()
@@ -137,6 +138,14 @@ class AIAssistantView(ttk.Frame):
             state="disabled",
         )
         self.hil_pass_button.pack(side="right", padx=4)
+        self.hardware_continue_button = ttk.Button(
+            hil_frame,
+            text="Hardware fixed, continue",
+            command=self.resume_after_hardware,
+            state="disabled",
+        )
+        self.hardware_continue_button.pack(side="right", padx=4)
+        ttk.Button(hil_frame, text="Stop HIL", command=self.stop_hil).pack(side="right")
         ttk.Button(hil_frame, text="Run & verify", command=self.run_and_verify).pack(
             side="right"
         )
@@ -235,7 +244,8 @@ class AIAssistantView(ttk.Frame):
         if not self.model.get().strip():
             messagebox.showerror("AI Assistant", "Select or enter a model first", parent=self); return
         self.input.delete("1.0", "end")
-        if requests_esp32(prompt):
+        self.hil_autopilot = requests_esp32(prompt)
+        if self.hil_autopilot:
             hardware = self.refresh_hardware()
             if not (hardware.connected and hardware.platform == "ESP32"):
                 self.pending_prompt = prompt
@@ -258,6 +268,7 @@ class AIAssistantView(ttk.Frame):
             self._append_message("You", prompt, "user")
         self._append_message("Assistant", "", "assistant")
         self.current_requirement = prompt
+        self.hil_autopilot = requests_esp32(prompt)
         self.generation_attempt = 0
         self.last_assistant_text, self.cancel_event = "", threading.Event()
         request = GenerationRequest(self.model.get().strip(), build_messages(self.history, self.refresh_hardware()))
@@ -365,7 +376,10 @@ class AIAssistantView(ttk.Frame):
                 elif kind == "complete":
                     self.last_assistant_text = value or self.last_assistant_text
                     self.history.append({"role": "assistant", "content": self.last_assistant_text})
-                    if self.write_editor.get(): self.write_last_code(silent=True)
+                    if self.hil_autopilot:
+                        self.deploy_and_verify(silent=True)
+                    elif self.write_editor.get():
+                        self.write_last_code(silent=True)
                 elif kind == "models":
                     self.model_combo["values"] = value
                     if value and self.model.get() not in value: self.model.set(value[0])
@@ -400,16 +414,7 @@ class AIAssistantView(ttk.Frame):
                 if not messagebox.askyesno("AI Assistant", "\n".join(cleaned.warnings) + "\n\nWrite anyway?", parent=self): return False
             self.adapter.write_editor(cleaned.code)
             if self.auto_run.get() or force_run:
-                decision = self.hil.start(
-                    self.current_requirement, cleaned.code, attempt=self.generation_attempt
-                )
-                self._handle_hil_decision(decision)
-                if decision.state == HilState.ARMED:
-                    try:
-                        self.adapter.execute_current()
-                    except Exception as exc:
-                        self._handle_hil_decision(self.hil.execution_rejected(str(exc)))
-                        raise
+                self._start_target_run(cleaned.code)
             self.status_text.set("Code written to editor")
             return True
         except Exception as exc:
@@ -420,11 +425,70 @@ class AIAssistantView(ttk.Frame):
     def run_and_verify(self):
         return self.write_last_code(force_run=True)
 
-    def cancel(self): self.cancel_event.set(); self.status_text.set("Cancelling…")
+    def deploy_and_verify(self, silent=False):
+        try:
+            cleaned = extract_code(self.last_assistant_text)
+            if cleaned.warnings:
+                raise RuntimeError("Generated code was blocked: " + "; ".join(cleaned.warnings))
+            self.adapter.write_editor(cleaned.code)
+            self.hil_status_text.set("HIL: deploying /main.py to ESP32…")
+            self.adapter.write_main_to_device(cleaned.code)
+            self.device_status_text.set("Saved /main.py; running hardware validation…")
+            self._start_target_run(cleaned.code)
+            return True
+        except Exception as exc:
+            if silent:
+                self.status_text.set(str(exc))
+                self._append_message("Deployment", str(exc), "error")
+            else:
+                messagebox.showerror("ESP32 deployment", str(exc), parent=self)
+            return False
+
+    def _start_target_run(self, code):
+        decision = self.hil.start(
+            self.current_requirement, code, attempt=self.generation_attempt
+        )
+        self._handle_hil_decision(decision)
+        if decision.state == HilState.ARMED:
+            try:
+                self.adapter.execute_current()
+            except Exception as exc:
+                self._handle_hil_decision(self.hil.execution_rejected(str(exc)))
+                raise
+
+    def resume_after_hardware(self):
+        if not self.adapter.ready_for_run():
+            messagebox.showinfo(
+                "HIL verification",
+                "Wait until the ESP32 Shell prompt is ready, then continue.",
+                parent=self,
+            )
+            return
+        decision = self.hil.resume_after_hardware()
+        self._handle_hil_decision(decision)
+        if decision and decision.state == HilState.ARMED:
+            try:
+                self.adapter.execute_current()
+            except Exception as exc:
+                self._handle_hil_decision(self.hil.execution_rejected(str(exc)))
+                messagebox.showerror("HIL verification", str(exc), parent=self)
+
+    def cancel(self):
+        self.cancel_event.set()
+        if self.hil.state in (HilState.RUNNING, HilState.WAITING_INPUT):
+            self.adapter.interrupt_current()
+        self.status_text.set("Cancelling…")
+
+    def stop_hil(self):
+        self.cancel_event.set()
+        if self.hil.state in (HilState.RUNNING, HilState.WAITING_INPUT):
+            self.adapter.interrupt_current()
+        self._handle_hil_decision(self.hil.cancel())
 
     def clear(self):
         self.history.clear(); self.last_assistant_text = ""
-        self.hil = HilAgent(max_repairs=2)
+        self.hil = HilAgent(max_repairs=None)
+        self.hil_autopilot = False
         self._set_observation_buttons(False)
         self.hil_status_text.set("HIL verification idle")
         self.chat.configure(state="normal"); self.chat.delete("1.0", "end"); self.chat.configure(state="disabled")
@@ -487,14 +551,27 @@ class AIAssistantView(ttk.Frame):
         self.hil_status_text.set("HIL: " + decision.reason)
         awaiting = decision.state == HilState.AWAITING_OBSERVATION
         self._set_observation_buttons(awaiting)
+        self.hardware_continue_button.configure(
+            state="normal" if decision.state == HilState.AWAITING_HARDWARE else "disabled"
+        )
         if decision.state == HilState.PASSED:
             self._append_message("Verification", "Passed: " + decision.reason, "assistant")
         elif decision.state == HilState.FAILED:
             self._append_message("Verification", "Failed: " + decision.reason, "error")
-            if decision.request_repair and self.auto_fix.get():
+            if decision.request_repair and (self.auto_fix.get() or self.hil_autopilot):
                 self.after_idle(lambda reason=decision.reason: self._start_repair(reason))
+        elif decision.state == HilState.AWAITING_HARDWARE:
+            self._append_message("Hardware action required", decision.reason, "error")
+            messagebox.showwarning(
+                "Hardware action required",
+                decision.reason + "\n\nFix the wiring or peripheral, then click Hardware fixed, continue.",
+                parent=self,
+            )
         elif decision.state in (HilState.DISCONNECTED, HilState.WAITING_INPUT):
-            self._append_message("Verification", decision.reason, "error")
+            tag = "assistant" if decision.state == HilState.WAITING_INPUT else "error"
+            self._append_message("Verification", decision.reason, tag)
+        elif decision.state == HilState.CANCELLED:
+            self._append_message("Verification", decision.reason, "assistant")
 
     def _set_observation_buttons(self, enabled):
         state = "normal" if enabled else "disabled"
