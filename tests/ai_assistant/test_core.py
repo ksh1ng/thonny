@@ -10,6 +10,7 @@ from thonny.plugins.ai_assistant.config_manager import ConfigManager
 from thonny.plugins.ai_assistant.device_setup import SetupState, choose_state, port_choices, requests_esp32
 from thonny.plugins.ai_assistant.hardware_context import detect_hardware, describe_hardware
 from thonny.plugins.ai_assistant.models import GenerationRequest
+from thonny.plugins.ai_assistant.prompt_builder import build_repair_messages
 from thonny.plugins.ai_assistant.providers.openai_compatible import OpenAICompatibleProvider, endpoint, profile_for
 
 
@@ -90,6 +91,20 @@ class HardwareTests(unittest.TestCase):
         context = detect_hardware(wb, runner)
         self.assertEqual(context.platform, "ESP32")
         self.assertNotIn("GPIO2", describe_hardware(context))
+
+    def test_repair_evidence_is_redacted(self):
+        runner = Mock()
+        runner.get_backend_proxy.return_value = None
+        messages = build_repair_messages(
+            "connect token: secret-token-value",
+            "password = 'wifi-secret-value'",
+            "api_key=provider-secret-value",
+            "OSError",
+            detect_hardware(Mock(), runner),
+        )
+        text = messages[-1]["content"]
+        self.assertNotIn("secret-token-value", text)
+        self.assertNotIn("provider-secret-value", text)
 
 
 class DeviceSetupTests(unittest.TestCase):

@@ -1,15 +1,16 @@
 import queue
 import threading
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
 from thonny import get_runner, get_workbench
 from thonny.plugins.ai_assistant.code_sanitizer import extract_code
 from thonny.plugins.ai_assistant.config_manager import ConfigManager
 from thonny.plugins.ai_assistant.device_setup import SetupState, choose_state, requests_esp32
 from thonny.plugins.ai_assistant.hardware_context import detect_hardware
+from thonny.plugins.ai_assistant.hil_agent import HilAgent, HilState
 from thonny.plugins.ai_assistant.models import GenerationRequest
-from thonny.plugins.ai_assistant.prompt_builder import build_messages
+from thonny.plugins.ai_assistant.prompt_builder import build_messages, build_repair_messages
 from thonny.plugins.ai_assistant.providers import CodexAccountProvider, PROFILES, OpenAICompatibleProvider, profile_for
 from thonny.plugins.ai_assistant.providers.base import RequestCancelled
 from thonny.plugins.ai_assistant.thonny_adapter import ThonnyAdapter
@@ -40,6 +41,10 @@ class AIAssistantView(ttk.Frame):
         self.device_port = tk.StringVar()
         self.device_ports = {}
         self.pending_prompt = None
+        self.hil = HilAgent(max_repairs=2)
+        self.hil_status_text = tk.StringVar(value="HIL verification idle")
+        self.current_requirement = ""
+        self.generation_attempt = 0
         self._build_ui()
         self._provider_changed()
         self.refresh_hardware()
@@ -113,15 +118,37 @@ class AIAssistantView(ttk.Frame):
         options.grid(row=5, column=0, sticky="ew")
         for label, var in (("Write to editor", self.write_editor), ("Auto-run", self.auto_run), ("Auto-fix", self.auto_fix)):
             ttk.Checkbutton(options, text=label, variable=var).pack(side="left")
+        hil_frame = ttk.Frame(self)
+        hil_frame.grid(row=6, column=0, sticky="ew", pady=(3, 0))
+        ttk.Label(hil_frame, textvariable=self.hil_status_text).pack(
+            side="left", fill="x", expand=True
+        )
+        self.hil_fail_button = ttk.Button(
+            hil_frame,
+            text="Result incorrect",
+            command=self.reject_hardware_result,
+            state="disabled",
+        )
+        self.hil_fail_button.pack(side="right")
+        self.hil_pass_button = ttk.Button(
+            hil_frame,
+            text="Result correct",
+            command=self.confirm_hardware_result,
+            state="disabled",
+        )
+        self.hil_pass_button.pack(side="right", padx=4)
+        ttk.Button(hil_frame, text="Run & verify", command=self.run_and_verify).pack(
+            side="right"
+        )
         buttons = ttk.Frame(self)
-        buttons.grid(row=6, column=0, sticky="ew", pady=(3, 0))
+        buttons.grid(row=7, column=0, sticky="ew", pady=(3, 0))
         self.send_button = ttk.Button(buttons, text="Send", command=self.send)
         self.send_button.pack(side="right")
         self.cancel_button = ttk.Button(buttons, text="Cancel", command=self.cancel, state="disabled")
         self.cancel_button.pack(side="right", padx=4)
         ttk.Button(buttons, text="Write code", command=self.write_last_code).pack(side="right")
         ttk.Button(buttons, text="Clear", command=self.clear).pack(side="left")
-        ttk.Label(self, textvariable=self.status_text).grid(row=7, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(self, textvariable=self.status_text).grid(row=8, column=0, sticky="w", pady=(3, 0))
 
     def _provider_changed(self):
         profile = profile_for(self.provider_id.get())
@@ -230,10 +257,32 @@ class AIAssistantView(ttk.Frame):
             self.history.append({"role": "user", "content": prompt})
             self._append_message("You", prompt, "user")
         self._append_message("Assistant", "", "assistant")
+        self.current_requirement = prompt
+        self.generation_attempt = 0
         self.last_assistant_text, self.cancel_event = "", threading.Event()
         request = GenerationRequest(self.model.get().strip(), build_messages(self.history, self.refresh_hardware()))
         self._save_preferences(); self._busy(True, "Generating…")
         self.worker = threading.Thread(target=self._generate_worker, args=(self._provider(), request, self.cancel_event), daemon=True)
+        self.worker.start()
+
+    def _start_repair(self, reason):
+        run = self.hil.active
+        if run is None:
+            return
+        self.hil.mark_repairing()
+        self.generation_attempt = run.attempt + 1
+        self._append_message("Assistant repair %d" % self.generation_attempt, "", "assistant")
+        self.last_assistant_text, self.cancel_event = "", threading.Event()
+        messages = build_repair_messages(
+            run.requirement, run.code, run.output, reason, self.refresh_hardware()
+        )
+        request = GenerationRequest(self.model.get().strip(), messages)
+        self._busy(True, "Repairing from target evidence…")
+        self.worker = threading.Thread(
+            target=self._generate_worker,
+            args=(self._provider(), request, self.cancel_event),
+            daemon=True,
+        )
         self.worker.start()
 
     def scan_esp32(self):
@@ -343,24 +392,41 @@ class AIAssistantView(ttk.Frame):
         self.chat.configure(state="normal"); self.chat.insert("end", text, tag)
         self.chat.configure(state="disabled"); self.chat.see("end")
 
-    def write_last_code(self, silent=False):
+    def write_last_code(self, silent=False, force_run=False):
         try:
             cleaned = extract_code(self.last_assistant_text)
             if cleaned.warnings:
                 if silent: self.status_text.set("Code has warnings; review before writing"); return False
                 if not messagebox.askyesno("AI Assistant", "\n".join(cleaned.warnings) + "\n\nWrite anyway?", parent=self): return False
             self.adapter.write_editor(cleaned.code)
-            if self.auto_run.get(): self.adapter.execute_current()
-            self.status_text.set("Code written to editor"); return True
+            if self.auto_run.get() or force_run:
+                decision = self.hil.start(
+                    self.current_requirement, cleaned.code, attempt=self.generation_attempt
+                )
+                self._handle_hil_decision(decision)
+                if decision.state == HilState.ARMED:
+                    try:
+                        self.adapter.execute_current()
+                    except Exception as exc:
+                        self._handle_hil_decision(self.hil.execution_rejected(str(exc)))
+                        raise
+            self.status_text.set("Code written to editor")
+            return True
         except Exception as exc:
             if silent: self.status_text.set(str(exc))
             else: messagebox.showerror("AI Assistant", str(exc), parent=self)
             return False
 
+    def run_and_verify(self):
+        return self.write_last_code(force_run=True)
+
     def cancel(self): self.cancel_event.set(); self.status_text.set("Cancelling…")
 
     def clear(self):
         self.history.clear(); self.last_assistant_text = ""
+        self.hil = HilAgent(max_repairs=2)
+        self._set_observation_buttons(False)
+        self.hil_status_text.set("HIL verification idle")
         self.chat.configure(state="normal"); self.chat.delete("1.0", "end"); self.chat.configure(state="disabled")
 
     def _busy(self, busy, text):
@@ -374,6 +440,25 @@ class AIAssistantView(ttk.Frame):
             self.config.set(name, value)
 
     def _on_backend_event(self, name, event):
+        if name == "ProgramOutput":
+            self._handle_hil_decision(self.hil.feed_output(getattr(event, "data", "")))
+            return
+        if name == "CommandAccepted":
+            command = getattr(event, "command", None)
+            decision = self.hil.command_accepted(getattr(command, "name", ""))
+            self._handle_hil_decision(decision)
+            if decision and decision.state == HilState.RUNNING:
+                run_id = self.hil.active.run_id
+                self.after(
+                    5000,
+                    lambda: self._handle_hil_decision(
+                        self.hil.observation_timeout(run_id)
+                    ),
+                )
+            return
+        if name == "InputRequest":
+            self._handle_hil_decision(self.hil.input_requested())
+            return
         if name not in ("BackendRestart", "BackendTerminated", "ToplevelResponse"):
             return
         hardware = self.refresh_hardware()
@@ -385,12 +470,48 @@ class AIAssistantView(ttk.Frame):
             self.device_status_text.set(
                 "MicroPython did not start. Check the USB connection; if the board is blank or uses other firmware, click Install MicroPython."
             )
+        elif name == "BackendTerminated":
+            self._handle_hil_decision(self.hil.disconnected())
         elif name == "ToplevelResponse" and state == SetupState.READY:
             self.device_frame.grid()
             self.device_status_text.set("3/4 ESP32 is connected and MicroPython is ready. Generating your program…")
             if self.pending_prompt:
                 prompt, self.pending_prompt = self.pending_prompt, None
                 self.after_idle(lambda: self._start_generation(prompt, add_user=False))
+            else:
+                self._handle_hil_decision(self.hil.toplevel_finished())
+
+    def _handle_hil_decision(self, decision):
+        if decision is None:
+            return
+        self.hil_status_text.set("HIL: " + decision.reason)
+        awaiting = decision.state == HilState.AWAITING_OBSERVATION
+        self._set_observation_buttons(awaiting)
+        if decision.state == HilState.PASSED:
+            self._append_message("Verification", "Passed: " + decision.reason, "assistant")
+        elif decision.state == HilState.FAILED:
+            self._append_message("Verification", "Failed: " + decision.reason, "error")
+            if decision.request_repair and self.auto_fix.get():
+                self.after_idle(lambda reason=decision.reason: self._start_repair(reason))
+        elif decision.state in (HilState.DISCONNECTED, HilState.WAITING_INPUT):
+            self._append_message("Verification", decision.reason, "error")
+
+    def _set_observation_buttons(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.hil_pass_button.configure(state=state)
+        self.hil_fail_button.configure(state=state)
+
+    def confirm_hardware_result(self):
+        self._handle_hil_decision(self.hil.observe(True, "User confirmed the hardware behavior"))
+
+    def reject_hardware_result(self):
+        feedback = simpledialog.askstring(
+            "Hardware observation",
+            "What did the hardware do instead? This evidence will be sent for repair.",
+            parent=self,
+        )
+        if feedback is not None:
+            self._handle_hil_decision(self.hil.observe(False, feedback.strip()))
 
     def destroy(self):
         self.cancel_event.set(); self.adapter.close(); super().destroy()
